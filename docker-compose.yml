@@ -1,0 +1,34 @@
+version: '3.8'
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: credit-default-api
+    ports:
+      - "8000:8000"
+    volumes:
+      # Mount models directory
+      - ./models:/app/models:ro
+      # Mount data directory (optional, for training)
+      - ./data:/app/data:ro
+    environment:
+      - MODEL_NAME=gbt_credit_default
+      - MODEL_DIR=models
+      - SPARK_DRIVER_MEMORY=4g
+      - SPARK_EXECUTOR_MEMORY=4g
+      - LOG_LEVEL=INFO
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    networks:
+      - credit-api-network
+
+networks:
+  credit-api-network:
+    driver: bridge

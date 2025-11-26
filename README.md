@@ -17,6 +17,7 @@ A **production-ready big-data machine learning pipeline** for predicting credit 
 - [Features](#-features)
 - [Installation](#-installation)
 - [Usage](#-usage)
+- [API Deployment](#-api-deployment)
 - [Project Structure](#-project-structure)
 - [Technologies](#-technologies)
 - [Results](#-results)
@@ -202,6 +203,136 @@ The notebook includes:
 
 ---
 
+## 🚀 API Deployment
+
+Deploy the trained model as a **REST API** for real-time predictions using FastAPI.
+
+### Quick Start
+
+1. **Train the model**
+   ```bash
+   python train_model.py
+   ```
+   This creates the `models/` directory with trained artifacts.
+
+2. **Install API dependencies**
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+3. **Start the API server**
+   ```bash
+   uvicorn app:app --reload
+   ```
+
+4. **Access the API**
+   - API: http://localhost:8000
+   - Interactive docs: http://localhost:8000/docs
+   - Alternative docs: http://localhost:8000/redoc
+
+### API Endpoints
+
+#### Health Check
+```bash
+curl http://localhost:8000/health
+```
+
+#### Single Prediction
+```bash
+curl -X POST http://localhost:8000/predict \
+  -H "Content-Type: application/json" \
+  -d '{
+    "customer": {
+      "customer_id": "CUST123",
+      "features": {
+        "B_1": 0.5,
+        "B_2": 1.2,
+        "B_30": "A",
+        "D_39": 0.8
+      }
+    }
+  }'
+```
+
+**Response:**
+```json
+{
+  "customer_id": "CUST123",
+  "prediction": 0,
+  "probability": 0.23,
+  "risk_level": "low"
+}
+```
+
+#### Batch Prediction
+```bash
+curl -X POST http://localhost:8000/predict/batch \
+  -H "Content-Type: application/json" \
+  -d '{
+    "customers": [
+      {"customer_id": "CUST123", "features": {...}},
+      {"customer_id": "CUST456", "features": {...}}
+    ]
+  }'
+```
+
+### Docker Deployment
+
+**Build and run with Docker Compose:**
+
+```bash
+# Build the image
+docker-compose build
+
+# Start the service
+docker-compose up -d
+
+# Check logs
+docker-compose logs -f api
+
+# Stop the service
+docker-compose down
+```
+
+The API will be available at `http://localhost:8000`
+
+### Python Client Example
+
+```python
+import requests
+
+response = requests.post(
+    "http://localhost:8000/predict",
+    json={
+        "customer": {
+            "customer_id": "CUST123",
+            "features": {
+                "B_1": 0.5,
+                "B_2": 1.2,
+                # ... more features
+            }
+        }
+    }
+)
+
+result = response.json()
+print(f"Prediction: {result['prediction']}")
+print(f"Probability: {result['probability']:.2%}")
+print(f"Risk Level: {result['risk_level']}")
+```
+
+### Production Considerations
+
+- **Authentication**: Add API keys or OAuth for production
+- **Rate Limiting**: Implement rate limiting to prevent abuse
+- **Monitoring**: Set up logging and metrics (Prometheus, Grafana)
+- **Scaling**: Deploy multiple instances behind a load balancer
+- **Model Storage**: Use cloud storage (S3, GCS) for model artifacts
+
+📖 **For detailed API documentation**, see [API_USAGE.md](API_USAGE.md)
+
+---
+
 ## 📁 Project Structure
 
 ```
@@ -209,10 +340,24 @@ spark_bigdata_classification/
 │
 ├── American_Express.ipynb    # Main ML pipeline (data cleaning → modeling → evaluation)
 ├── get_data.ipynb            # Data acquisition script
-├── README.md                 # Project documentation (this file)
+├── train_model.py            # Standalone model training script
+├── app.py                    # FastAPI application
+├── schemas.py                # API request/response schemas
+├── requirements.txt          # Python dependencies
+├── Dockerfile                # Docker container configuration
+├── docker-compose.yml        # Docker orchestration
+├── .env.example             # Environment configuration template
+├── .gitignore               # Git exclusions
+├── README.md                # Project documentation (this file)
+├── API_USAGE.md             # Detailed API usage guide
 │
-└── data/                     # Data directory (created after running get_data.ipynb)
-    └── amex-raddar-parquet/  # Parquet dataset files
+├── models/                  # Trained models (created by train_model.py)
+│   ├── gbt_credit_default_preprocessing/
+│   ├── gbt_credit_default_gbt/
+│   └── gbt_credit_default_metadata.json
+│
+└── data/                    # Data directory (created after running get_data.ipynb)
+    └── amex-raddar-parquet/ # Parquet dataset files
         └── data_clean.parquet
 ```
 
