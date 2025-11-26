@@ -193,22 +193,34 @@ def train_model(df_train, df_test):
     """Train the GBT classifier"""
     print("\nTraining GBT model...")
     
+    # Filter out rows with null target values
+    df_train_clean = df_train.filter(F.col("target").isNotNull())
+    df_test_clean = df_test.filter(F.col("target").isNotNull())
+    
+    print(f"Training samples after removing null targets: {df_train_clean.count():,}")
+    
     # Calculate class weights
-    label_counts = df_train.groupBy("target").count().collect()
+    label_counts = df_train_clean.groupBy("target").count().collect()
     total = sum([row['count'] for row in label_counts])
     
     class_weights = {}
     for row in label_counts:
-        label = row['target']
+        label = int(row['target'])  # Ensure label is int, not None
         count = row['count']
         weight = total / (2.0 * count)
         class_weights[label] = weight
     
     print(f"Class weights: {class_weights}")
     
-    # Add weight column
-    weight_map = F.create_map([F.lit(x) for pair in class_weights.items() for x in pair])
-    df_train_weighted = df_train.withColumn("weight", weight_map[F.col("target")])
+    # Add weight column - use when() to avoid null keys
+    weight_expr = F.when(F.col("target") == 0, F.lit(class_weights.get(0, 1.0)))
+    for label, weight in class_weights.items():
+        if label != 0:
+            weight_expr = weight_expr.when(F.col("target") == label, F.lit(weight))
+    weight_expr = weight_expr.otherwise(F.lit(1.0))
+    
+    df_train_weighted = df_train_clean.withColumn("weight", weight_expr)
+
     
     # Define GBT model
     gbt = GBTClassifier(
@@ -228,7 +240,7 @@ def train_model(df_train, df_test):
     
     print(f"Training completed in {training_time:.2f} seconds")
     
-    return model
+    return model, df_test_clean
 
 
 def evaluate_model(model, df_test):
@@ -358,10 +370,10 @@ def main():
         test_processed = preprocessing_model.transform(test_df)
         
         # Train model
-        model = train_model(train_processed, test_processed)
+        model, test_processed_clean = train_model(train_processed, test_processed)
         
         # Evaluate model
-        metrics = evaluate_model(model, test_processed)
+        metrics = evaluate_model(model, test_processed_clean)
         
         # Save artifacts
         model_path = save_artifacts(preprocessing_model, model, feature_metadata, metrics)
