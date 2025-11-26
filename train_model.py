@@ -3,14 +3,19 @@ Model Training Script for Credit Default Prediction
 
 This script extracts the training logic from the Jupyter notebook and creates
 a standalone training pipeline that saves the model for API deployment.
+
+IMPORTANT: This script matches the exact data cleaning and preprocessing logic
+from American_Express.ipynb to ensure consistency.
 """
 
 import os
 import json
+import time
 from datetime import datetime
+from functools import reduce
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
-from pyspark.ml.feature import StringIndexer, VectorAssembler, StandardScaler, Imputer
+from pyspark.ml.feature import StringIndexer, VectorAssembler, StandardScaler
 from pyspark.ml.classification import GBTClassifier
 from pyspark.ml.evaluation import BinaryClassificationEvaluator
 from pyspark.ml import Pipeline
@@ -69,17 +74,20 @@ def load_and_prepare_data(spark):
     return df
 
 
-def define_feature_columns(df):
-    """Define categorical and numeric feature columns"""
+def clean_data(df):
+    """
+    Clean data using the EXACT same logic as American_Express.ipynb
+    1) Drop rows where ALL features are null/NaN
+    2) Drop columns with >95% missing values
+    3) Repartition and cache
+    """
+    print("\nStarting data cleaning...")
     
-    # Define column groups
+    # --- Define column groups (EXACTLY as in notebook) ---
     id_cols = ['customer_ID', 'date', 'test']
     label_col = 'target'
-    
-    categorical_cols = [
-        'B_30', 'B_38', 'D_114', 'D_116', 'D_117',
-        'D_120', 'D_126', 'D_63', 'D_64', 'D_66', 'D_68'
-    ]
+    categorical_cols = ['B_30', 'B_38', 'D_114', 'D_116', 'D_117',
+                        'D_120', 'D_126', 'D_63', 'D_64', 'D_66', 'D_68']
     
     # Filter to existing categorical columns
     categorical_cols = [c for c in categorical_cols if c in df.columns]
@@ -92,105 +100,242 @@ def define_feature_columns(df):
     ]
     
     feature_cols = numeric_cols + categorical_cols
+    print(f"Total feature columns: {len(feature_cols)} (numeric: {len(numeric_cols)}, cat: {len(categorical_cols)})")
     
-    print(f"\nFeature columns: {len(feature_cols)}")
-    print(f"  - Numeric: {len(numeric_cols)}")
-    print(f"  - Categorical: {len(categorical_cols)}")
+    # --------------------------------------------------------------
+    # 1) Drop rows where ALL feature columns are null/NaN
+    # --------------------------------------------------------------
     
-    return {
+    print("Building condition to drop rows with ALL features missing...")
+    
+    conditions = (
+        [F.col(c).isNull() | F.isnan(c) for c in numeric_cols] +
+        [F.col(c).isNull() for c in categorical_cols]
+    )
+    
+    if conditions:
+        all_null_cond = reduce(lambda x, y: x & y, conditions)
+        df_no_allnull = df.filter(~all_null_cond)
+    else:
+        df_no_allnull = df  # no features → keep all
+    
+    rows_before = df.count()
+    rows_after = df_no_allnull.count()
+    print(f"Rows before: {rows_before:,}")
+    print(f"Rows after dropping all-null-feature rows: {rows_after:,}")
+    
+    # --------------------------------------------------------------
+    # 2) Drop columns with >95% missing
+    # --------------------------------------------------------------
+    
+    missing_threshold = 0.95
+    row_count = rows_after
+    
+    print(f"Computing missing rates for {len(feature_cols)} feature columns...")
+    
+    null_exprs = []
+    for c in feature_cols:
+        if c in numeric_cols:
+            null_exprs.append(
+                F.sum((F.col(c).isNull() | F.isnan(c)).cast("int")).alias(c)
+            )
+        else:
+            null_exprs.append(F.sum(F.col(c).isNull().cast("int")).alias(c))
+    
+    missing_counts = df_no_allnull.select(null_exprs).first().asDict()
+    drop_cols = [
+        c for c in feature_cols
+        if missing_counts.get(c, 0) / row_count > missing_threshold
+    ]
+    
+    print(f"Columns to drop (>{missing_threshold*100:.0f}% missing): {len(drop_cols)}")
+    if drop_cols:
+        print(drop_cols)
+    
+    df_clean = df_no_allnull.drop(*drop_cols)
+    
+    print(f"Final number of columns: {len(df_clean.columns)}")
+    
+    # --------------------------------------------------------------
+    # 3) REPARTITION + CACHE df_clean
+    # --------------------------------------------------------------
+    
+    print("Optimizing df_clean for maximum performance...")
+    df_clean = df_clean.repartition(SHUFFLE_PARTS)
+    df_clean = df_clean.cache()
+    
+    print("Triggering cache on df_clean ...")
+    start_cache = time.time()
+    cached_rows = df_clean.count()
+    print(f"Cache ready in {time.time() - start_cache:.1f}s")
+    
+    print("\n" + "="*80)
+    print(f"Rows       : {cached_rows:,}")
+    print(f"Columns    : {len(df_clean.columns)}")
+    print(f"Partitions : {df_clean.rdd.getNumPartitions()}")
+    print("="*80)
+    
+    # Return metadata for later use
+    metadata = {
         'id_cols': id_cols,
         'label_col': label_col,
         'categorical_cols': categorical_cols,
         'numeric_cols': numeric_cols,
-        'feature_cols': feature_cols
+        'feature_cols': feature_cols,
+        'dropped_cols': drop_cols
     }
+    
+    return df_clean, metadata
 
 
-def clean_data(df, feature_metadata):
-    """Clean data by removing rows with all features missing"""
-    print("\nCleaning data...")
+def impute_data(df, metadata, spark):
+    """
+    Impute missing values using EXACT same logic as notebook
+    - Numeric: mean imputation using coalesce
+    - Categorical: fillna with "missing"
+    """
+    print("\nStarting imputation...")
     
-    feature_cols = feature_metadata['feature_cols']
-    numeric_cols = feature_metadata['numeric_cols']
-    categorical_cols = feature_metadata['categorical_cols']
+    id_cols = metadata['id_cols']
+    label_col = metadata['label_col']
+    categorical_cols = metadata['categorical_cols']
     
-    # Build condition to drop rows where ALL features are null/NaN
-    conditions = (
-        [F.col(c).isNull() for c in categorical_cols] +
-        [F.col(c).isNull() | F.isnan(c) for c in numeric_cols]
+    start = time.time()
+    
+    # REBUILD numeric_cols FROM THE CURRENT df_clean (CRITICAL!)
+    numeric_cols = [
+        c for c, t in df.dtypes
+        if c not in id_cols + [label_col] + categorical_cols
+        and t in ('int', 'bigint', 'float', 'double', 'smallint', 'tinyint')
+    ]
+    
+    print(f"Using {len(numeric_cols)} numeric columns that actually exist")
+    
+    # ONE JOB — compute means
+    print("Computing means ...")
+    mean_exprs = [F.mean(c).alias(f"{c}_mean") for c in numeric_cols]
+    means_row = df.select(*mean_exprs).first()
+    
+    mean_dict = {c: means_row[f"{c}_mean"] for c in numeric_cols}
+    broadcast_means = spark.sparkContext.broadcast(mean_dict)
+    
+    print(f"Means computed in {time.time()-start:.1f}s")
+    
+    # Imputation
+    print("Applying mean imputation...")
+    df_imputed = (
+        df.select(
+            *[F.coalesce(F.col(c), F.lit(broadcast_means.value[c])).alias(c)
+              if c in numeric_cols else F.col(c)
+              for c in df.columns]
+        )
+        .fillna("missing", subset=categorical_cols)
+        .cache()
     )
     
-    all_null_condition = conditions[0]
-    for cond in conditions[1:]:
-        all_null_condition = all_null_condition & cond
+    df_imputed.count()
+    print(f"\nIMPUTATION DONE IN {time.time()-start:.1f} SECONDS")
     
-    initial_count = df.count()
-    df_clean = df.filter(~all_null_condition)
-    final_count = df_clean.count()
+    # Update metadata with current numeric_cols
+    metadata['numeric_cols'] = numeric_cols
     
-    print(f"Removed {initial_count - final_count:,} rows with all features missing")
-    print(f"Remaining rows: {final_count:,}")
-    
-    return df_clean
+    return df_imputed, metadata
 
 
-def build_preprocessing_pipeline(feature_metadata):
-    """Build the preprocessing pipeline"""
-    print("\nBuilding preprocessing pipeline...")
+def index_categorical(df, metadata):
+    """
+    Index categorical columns using StringIndexer (EXACT same as notebook)
+    """
+    print("\nIndexing categorical columns...")
     
-    numeric_cols = feature_metadata['numeric_cols']
-    categorical_cols = feature_metadata['categorical_cols']
+    categorical_cols = metadata['categorical_cols']
     
-    stages = []
+    # New names for indexed columns
+    categorical_indexed_cols = [c + "_idx" for c in categorical_cols]
     
-    # 1. Impute numeric features
-    if numeric_cols:
-        imputer_numeric = Imputer(
-            inputCols=numeric_cols,
-            outputCols=[f"{c}_imputed" for c in numeric_cols],
-            strategy="mean"
+    # One StringIndexer per categorical column
+    indexers = [
+        StringIndexer(
+            inputCol=c,
+            outputCol=c + "_idx",
+            handleInvalid="keep"  # important: keep unseen/Null as a valid index
         )
-        stages.append(imputer_numeric)
+        for c in categorical_cols
+    ]
     
-    # 2. Index categorical features
-    indexed_cat_cols = []
-    for col in categorical_cols:
-        indexer = StringIndexer(
-            inputCol=col,
-            outputCol=f"{col}_indexed",
-            handleInvalid="keep"
-        )
-        stages.append(indexer)
-        indexed_cat_cols.append(f"{col}_indexed")
+    # Build and fit pipeline
+    indexer_pipeline = Pipeline(stages=indexers)
+    indexer_model = indexer_pipeline.fit(df)
+    df_indexed = indexer_model.transform(df)
     
-    # 3. Assemble all features
-    imputed_numeric_cols = [f"{c}_imputed" for c in numeric_cols]
-    all_feature_cols = imputed_numeric_cols + indexed_cat_cols
+    print("Indexed categorical columns added:")
+    print(categorical_indexed_cols)
     
+    metadata['categorical_indexed_cols'] = categorical_indexed_cols
+    metadata['indexer_model'] = indexer_model
+    
+    return df_indexed, metadata
+
+
+def assemble_and_scale(df, metadata):
+    """
+    VectorAssembler + StandardScaler (EXACT same as notebook)
+    """
+    print("\nAssembling and scaling features...")
+    
+    id_cols = metadata['id_cols']
+    label_col = metadata['label_col']
+    categorical_cols = metadata['categorical_cols']
+    categorical_indexed_cols = metadata['categorical_indexed_cols']
+    
+    # 1) Identify numeric feature columns
+    numeric_types = ('int', 'bigint', 'float', 'double', 'smallint', 'tinyint')
+    
+    numeric_feature_cols = [
+        c for c, t in df.dtypes
+        if c not in id_cols + [label_col] + categorical_cols + categorical_indexed_cols
+        and t in numeric_types
+    ]
+    
+    print("Numeric feature columns:", len(numeric_feature_cols))
+    print("Categorical indexed feature columns:", len(categorical_indexed_cols))
+    
+    # 2) All input feature columns for the model
+    feature_input_cols = numeric_feature_cols + categorical_indexed_cols
+    print("Total feature columns going into assembler:", len(feature_input_cols))
+    
+    # 3) VectorAssembler → features_unnorm
     assembler = VectorAssembler(
-        inputCols=all_feature_cols,
-        outputCol="features_raw",
-        handleInvalid="skip"
+        inputCols=feature_input_cols,
+        outputCol="features_unnorm"
     )
-    stages.append(assembler)
     
-    # 4. Scale features
+    df_assembled = assembler.transform(df)
+    
+    # 4) StandardScaler → features (final feature vector)
     scaler = StandardScaler(
-        inputCol="features_raw",
+        inputCol="features_unnorm",
         outputCol="features",
         withStd=True,
-        withMean=True
+        withMean=True  # center to mean 0
     )
-    stages.append(scaler)
     
-    pipeline = Pipeline(stages=stages)
+    scaler_model = scaler.fit(df_assembled)
+    df_final = scaler_model.transform(df_assembled)
     
-    print(f"Pipeline stages: {len(stages)}")
-    return pipeline
+    print("Final dataframe for modeling:")
+    print(f"  Features column: 'features' (vector of {len(feature_input_cols)} elements)")
+    
+    metadata['assembler'] = assembler
+    metadata['scaler_model'] = scaler_model
+    metadata['feature_input_cols'] = feature_input_cols
+    metadata['numeric_feature_cols'] = numeric_feature_cols
+    
+    return df_final, metadata
 
 
 def train_model(df_train, df_test):
-    """Train the GBT classifier"""
+    """Train the GBT classifier with class weights"""
     print("\nTraining GBT model...")
     
     # Filter out rows with null target values
@@ -205,7 +350,7 @@ def train_model(df_train, df_test):
     
     class_weights = {}
     for row in label_counts:
-        label = int(row['target'])  # Ensure label is int, not None
+        label = int(row['target'])
         count = row['count']
         weight = total / (2.0 * count)
         class_weights[label] = weight
@@ -220,7 +365,6 @@ def train_model(df_train, df_test):
     weight_expr = weight_expr.otherwise(F.lit(1.0))
     
     df_train_weighted = df_train_clean.withColumn("weight", weight_expr)
-
     
     # Define GBT model
     gbt = GBTClassifier(
@@ -289,7 +433,7 @@ def evaluate_model(model, df_test):
     return metrics
 
 
-def save_artifacts(preprocessing_pipeline, model, feature_metadata, metrics):
+def save_artifacts(metadata, model, metrics):
     """Save all model artifacts"""
     print(f"\nSaving model artifacts to {MODEL_OUTPUT_DIR}/...")
     
@@ -298,21 +442,36 @@ def save_artifacts(preprocessing_pipeline, model, feature_metadata, metrics):
     
     model_path = f"{MODEL_OUTPUT_DIR}/{MODEL_NAME}"
     
-    # Save preprocessing pipeline
-    pipeline_path = f"{model_path}_preprocessing"
-    preprocessing_pipeline.save(pipeline_path)
-    print(f"  Saved preprocessing pipeline to {pipeline_path}")
+    # Save indexer pipeline (categorical encoding)
+    indexer_path = f"{model_path}_indexer"
+    metadata['indexer_model'].save(indexer_path)
+    print(f"  Saved indexer pipeline to {indexer_path}")
+    
+    # Save assembler (we'll save this as part of a pipeline)
+    # Save scaler model
+    scaler_path = f"{model_path}_scaler"
+    metadata['scaler_model'].save(scaler_path)
+    print(f"  Saved scaler model to {scaler_path}")
     
     # Save GBT model
     gbt_model_path = f"{model_path}_gbt"
     model.save(gbt_model_path)
     print(f"  Saved GBT model to {gbt_model_path}")
     
-    # Save metadata
-    metadata = {
+    # Save metadata (without model objects)
+    metadata_to_save = {
         'model_name': MODEL_NAME,
         'created_at': datetime.now().isoformat(),
-        'feature_metadata': feature_metadata,
+        'feature_metadata': {
+            'id_cols': metadata['id_cols'],
+            'label_col': metadata['label_col'],
+            'categorical_cols': metadata['categorical_cols'],
+            'categorical_indexed_cols': metadata['categorical_indexed_cols'],
+            'numeric_cols': metadata['numeric_cols'],
+            'numeric_feature_cols': metadata['numeric_feature_cols'],
+            'feature_input_cols': metadata['feature_input_cols'],
+            'dropped_cols': metadata.get('dropped_cols', [])
+        },
         'metrics': metrics,
         'spark_config': {
             'cores': SPARK_CORES,
@@ -323,17 +482,28 @@ def save_artifacts(preprocessing_pipeline, model, feature_metadata, metrics):
     
     metadata_path = f"{model_path}_metadata.json"
     with open(metadata_path, 'w') as f:
-        json.dump(metadata, f, indent=2)
+        json.dump(metadata_to_save, f, indent=2)
     print(f"  Saved metadata to {metadata_path}")
+    
+    # Save assembler configuration
+    assembler_config = {
+        'inputCols': metadata['feature_input_cols'],
+        'outputCol': 'features_unnorm'
+    }
+    assembler_config_path = f"{model_path}_assembler_config.json"
+    with open(assembler_config_path, 'w') as f:
+        json.dump(assembler_config, f, indent=2)
+    print(f"  Saved assembler config to {assembler_config_path}")
     
     print("\n✅ All artifacts saved successfully!")
     return model_path
 
 
 def main():
-    """Main training pipeline"""
+    """Main training pipeline - EXACTLY matches American_Express.ipynb"""
     print("="*80)
     print("Credit Default Prediction - Model Training")
+    print("(Matches American_Express.ipynb exactly)")
     print("="*80)
     
     # Initialize Spark
@@ -343,40 +513,35 @@ def main():
         # Load data
         df = load_and_prepare_data(spark)
         
-        # Define features
-        feature_metadata = define_feature_columns(df)
+        # Clean data (EXACT same as notebook)
+        df_clean, metadata = clean_data(df)
         
-        # Clean data
-        df_clean = clean_data(df, feature_metadata)
+        # Impute data (EXACT same as notebook)
+        df_imputed, metadata = impute_data(df_clean, metadata, spark)
+        
+        # Index categorical columns (EXACT same as notebook)
+        df_indexed, metadata = index_categorical(df_imputed, metadata)
+        
+        # Assemble and scale features (EXACT same as notebook)
+        df_final, metadata = assemble_and_scale(df_indexed, metadata)
         
         # Split data
         print("\nSplitting data (80/20 train/test)...")
-        train_df, test_df = df_clean.randomSplit([0.8, 0.2], seed=42)
+        train_df, test_df = df_final.randomSplit([0.8, 0.2], seed=42)
         train_df.cache()
         test_df.cache()
         
         print(f"Training set: {train_df.count():,} rows")
         print(f"Test set: {test_df.count():,} rows")
         
-        # Build and fit preprocessing pipeline
-        preprocessing_pipeline = build_preprocessing_pipeline(feature_metadata)
-        print("\nFitting preprocessing pipeline...")
-        preprocessing_model = preprocessing_pipeline.fit(train_df)
-        
-        # Transform data
-        print("Transforming training data...")
-        train_processed = preprocessing_model.transform(train_df)
-        print("Transforming test data...")
-        test_processed = preprocessing_model.transform(test_df)
-        
         # Train model
-        model, test_processed_clean = train_model(train_processed, test_processed)
+        model, test_df_clean = train_model(train_df, test_df)
         
         # Evaluate model
-        metrics = evaluate_model(model, test_processed_clean)
+        metrics = evaluate_model(model, test_df_clean)
         
         # Save artifacts
-        model_path = save_artifacts(preprocessing_model, model, feature_metadata, metrics)
+        model_path = save_artifacts(metadata, model, metrics)
         
         print("\n" + "="*80)
         print("Training Complete!")
