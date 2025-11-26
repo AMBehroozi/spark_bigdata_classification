@@ -197,7 +197,7 @@ def create_spark_dataframe(features_dict: dict):
     
     schema = StructType(fields)
     
-    # Prepare row data
+    # Prepare row data - fill with None for missing features
     row_data = {}
     for col in numeric_cols + categorical_cols:
         value = features_dict.get(col)
@@ -212,15 +212,43 @@ def create_spark_dataframe(features_dict: dict):
     return df
 
 
+def impute_features(df):
+    """
+    Impute missing features using the same logic as training
+    - Numeric: Use mean values (we'll use 0.0 as default for API simplicity)
+    - Categorical: Use "missing"
+    """
+    from pyspark.sql import functions as F
+    
+    feature_metadata = model_metadata['feature_metadata']
+    numeric_cols = feature_metadata['numeric_cols']
+    categorical_cols = feature_metadata['categorical_cols']
+    
+    # For numeric columns: fill nulls with 0.0 (or you could store means from training)
+    # In production, you'd want to use the actual mean values from training
+    df_imputed = df.select(
+        *[F.coalesce(F.col(c), F.lit(0.0)).alias(c) if c in numeric_cols else F.col(c)
+          for c in df.columns]
+    )
+    
+    # For categorical columns: fill nulls with "missing"
+    df_imputed = df_imputed.fillna("missing", subset=categorical_cols)
+    
+    return df_imputed
+
+
 def make_prediction(features_dict: dict) -> tuple[int, float]:
     """Make a single prediction"""
     
     # Create Spark DataFrame
     df = create_spark_dataframe(features_dict)
     
+    # Impute missing features (CRITICAL: must match training pipeline)
+    df_imputed = impute_features(df)
+    
     # Apply preprocessing steps (matching the training pipeline)
     # 1. Apply indexer (categorical encoding)
-    df_indexed = preprocessing_model['indexer'].transform(df)
+    df_indexed = preprocessing_model['indexer'].transform(df_imputed)
     
     # 2. Apply assembler (combine features into vector)
     df_assembled = preprocessing_model['assembler'].transform(df_indexed)
