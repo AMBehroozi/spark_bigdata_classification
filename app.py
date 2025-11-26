@@ -74,30 +74,56 @@ def initialize_spark():
 
 
 def load_models():
-    """Load preprocessing pipeline and GBT model"""
+    """Load indexer, scaler, and GBT model"""
     global preprocessing_model, gbt_model, model_metadata
     
     logger.info(f"Loading models from {MODEL_DIR}...")
     
-    preprocessing_path = f"{MODEL_DIR}/{MODEL_NAME}_preprocessing"
+    indexer_path = f"{MODEL_DIR}/{MODEL_NAME}_indexer"
+    scaler_path = f"{MODEL_DIR}/{MODEL_NAME}_scaler"
     gbt_path = f"{MODEL_DIR}/{MODEL_NAME}_gbt"
     metadata_path = f"{MODEL_DIR}/{MODEL_NAME}_metadata.json"
+    assembler_config_path = f"{MODEL_DIR}/{MODEL_NAME}_assembler_config.json"
     
     # Check if model files exist
-    if not os.path.exists(preprocessing_path):
-        raise FileNotFoundError(f"Preprocessing model not found at {preprocessing_path}")
+    if not os.path.exists(indexer_path):
+        raise FileNotFoundError(f"Indexer model not found at {indexer_path}")
+    if not os.path.exists(scaler_path):
+        raise FileNotFoundError(f"Scaler model not found at {scaler_path}")
     if not os.path.exists(gbt_path):
         raise FileNotFoundError(f"GBT model not found at {gbt_path}")
     if not os.path.exists(metadata_path):
         raise FileNotFoundError(f"Model metadata not found at {metadata_path}")
+    if not os.path.exists(assembler_config_path):
+        raise FileNotFoundError(f"Assembler config not found at {assembler_config_path}")
     
     # Load models
-    preprocessing_model = PipelineModel.load(preprocessing_path)
+    from pyspark.ml.feature import StandardScalerModel, VectorAssembler
+    
+    indexer_model = PipelineModel.load(indexer_path)
+    scaler_model = StandardScalerModel.load(scaler_path)
     gbt_model = GBTClassificationModel.load(gbt_path)
     
     # Load metadata
     with open(metadata_path, 'r') as f:
         model_metadata = json.load(f)
+    
+    # Load assembler config
+    with open(assembler_config_path, 'r') as f:
+        assembler_config = json.load(f)
+    
+    # Create assembler from config
+    assembler = VectorAssembler(
+        inputCols=assembler_config['inputCols'],
+        outputCol=assembler_config['outputCol']
+    )
+    
+    # Store all components in a dict for preprocessing
+    preprocessing_model = {
+        'indexer': indexer_model,
+        'assembler': assembler,
+        'scaler': scaler_model
+    }
     
     logger.info("Models loaded successfully!")
     logger.info(f"Model created at: {model_metadata.get('created_at', 'unknown')}")
@@ -192,11 +218,18 @@ def make_prediction(features_dict: dict) -> tuple[int, float]:
     # Create Spark DataFrame
     df = create_spark_dataframe(features_dict)
     
-    # Apply preprocessing
-    df_processed = preprocessing_model.transform(df)
+    # Apply preprocessing steps (matching the training pipeline)
+    # 1. Apply indexer (categorical encoding)
+    df_indexed = preprocessing_model['indexer'].transform(df)
     
-    # Make prediction
-    prediction_df = gbt_model.transform(df_processed)
+    # 2. Apply assembler (combine features into vector)
+    df_assembled = preprocessing_model['assembler'].transform(df_indexed)
+    
+    # 3. Apply scaler (standardize features)
+    df_scaled = preprocessing_model['scaler'].transform(df_assembled)
+    
+    # 4. Make prediction with GBT model
+    prediction_df = gbt_model.transform(df_scaled)
     
     # Extract results
     result = prediction_df.select("prediction", "probability").collect()[0]

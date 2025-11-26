@@ -2,24 +2,23 @@
 Pydantic schemas for API request/response validation
 """
 
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Union
 from pydantic import BaseModel, Field, validator
 
 
 class CustomerFeatures(BaseModel):
     """Features for a single customer prediction"""
     
-    # Note: In production, you would list all 190+ features here
-    # For now, we'll use a flexible dict approach
-    features: Dict[str, Optional[float]] = Field(
+    # Note: Features can be either numeric (float) or categorical (string)
+    features: Dict[str, Optional[Union[float, str]]] = Field(
         ...,
-        description="Dictionary of feature names to values. Numeric features should be float, categorical can be string or int.",
+        description="Dictionary of feature names to values. Numeric features should be float, categorical features should be string.",
         example={
             "B_1": 0.5,
             "B_2": 1.2,
-            "B_30": "A",
+            "B_30": "A",  # Categorical feature
             "D_39": 0.8,
-            # ... more features
+            "D_114": "B"  # Categorical feature
         }
     )
     
